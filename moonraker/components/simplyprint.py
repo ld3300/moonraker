@@ -23,6 +23,7 @@ from utils import LocalQueueHandler
 
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Optional,
     Dict,
     List,
@@ -31,7 +32,7 @@ from typing import (
 )
 if TYPE_CHECKING:
     from confighelper import ConfigHelper
-    from websockets import WebsocketManager
+    from websockets import WebsocketManager, WebSocket
     from tornado.websocket import WebSocketClientConnection
     from components.database import MoonrakerDatabase
     from components.klippy_apis import KlippyAPI
@@ -52,25 +53,52 @@ class SimplyPrint(Subscribable):
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.eventloop = self.server.get_event_loop()
-        self.is_closing = False
-        self.test = config.get("sp_test", True)
-        self.ws: Optional[WebSocketClientConnection] = None
-        self.reported_state = "offline"
-        self.reported_temps: Dict[str, Any] = {}
-        self.last_received_temps: Dict[str, float] = {}
-        self.last_temp_update_time: float = 0.
-        self.last_err_log_time: float = 0.
-        self.printer_status: Dict[str, Dict[str, Any]] = {}
-        self.keepalive_hdl: Optional[asyncio.TimerHandle] = None
-        self.reconnect_hdl: Optional[asyncio.TimerHandle] = None
+        self.job_state: JobState
+        self.job_state = self.server.lookup_component("job_state")
+        self.klippy_apis: KlippyAPI
+        self.klippy_apis = self.server.lookup_component("klippy_apis")
         database: MoonrakerDatabase = self.server.lookup_component("database")
         database.register_local_namespace("simplyprint", forbidden=True)
         self.spdb = database.wrap_namespace("simplyprint")
         self.sp_info = self.spdb.as_dict()
-        # TODO: For testing we are initializing connectd to True.  This
-        # should be be set to False in the future
-        self.connected = True
-        self._set_ws_url()
+        self.is_closing = False
+        self.test = config.get("sp_test", True)
+        self.ws: Optional[WebSocketClientConnection] = None
+        self.cache = ReportCache()
+        self.amb_detect = AmbientDetect(
+            config, self.cache, self._on_ambient_changed,
+            self.sp_info.get("ambient_temp", INITIAL_AMBIENT)
+        )
+        self.last_received_temps: Dict[str, float] = {}
+        self.last_err_log_time: float = 0.
+        self.last_cpu_update_time: float = 0.
+        self.intervals: Dict[str, float] = {
+            "job": 1.,
+            "temps": 1.,
+            "temps_target": .25,
+            "cpu": 10.
+        }
+        self.printer_status: Dict[str, Dict[str, Any]] = {}
+        self.heaters: Dict[str, str] = {}
+        self.missed_job_events: List[Dict[str, Any]] = []
+        self.keepalive_hdl: Optional[asyncio.TimerHandle] = None
+        self.reconnect_hdl: Optional[asyncio.TimerHandle] = None
+        self.reconnect_delay: float = 1.
+        self.reconnect_token: Optional[str] = None
+        self.printer_info_timer = self.eventloop.register_timer(
+            self._handle_printer_info_update)
+        self.next_temp_update_time: float = 0.
+        self.gcode_terminal_enabled: bool = False
+        self.connected = False
+        self.is_set_up = False
+        # XXX: The configurable connect url is for testing,
+        # remove before release
+        connect_url = config.get("url", None)
+        if connect_url is not None:
+            self.connect_url = connect_url
+            self.is_set_up = True
+        else:
+            self._set_ws_url()
 
         # Register State Events
         self.server.register_event_handler(
@@ -86,7 +114,7 @@ class SimplyPrint(Subscribable):
         self.server.register_event_handler(
             "job_state:paused", self._on_print_paused)
         self.server.register_event_handler(
-            "job_state:resumed", self._on_print_start)
+            "job_state:resumed", self._on_print_resumed)
         self.server.register_event_handler(
             "job_state:standby", self._on_print_standby)
         self.server.register_event_handler(
@@ -95,6 +123,25 @@ class SimplyPrint(Subscribable):
             "job_state:error", self._on_print_error)
         self.server.register_event_handler(
             "job_state:cancelled", self._on_print_cancelled)
+        self.server.register_event_handler(
+            "klippy_apis:pause_requested", self._on_pause_requested)
+        self.server.register_event_handler(
+            "klippy_apis:resume_requested", self._on_resume_requested)
+        self.server.register_event_handler(
+            "klippy_apis:cancel_requested", self._on_cancel_requested)
+        self.server.register_event_handler(
+            "proc_stats:proc_stat_update", self._on_proc_update)
+        self.server.register_event_handler(
+            "websockets:websocket_identified",
+            self._on_websocket_identified)
+        self.server.register_event_handler(
+            "websockets:websocket_removed",
+            self._on_websocket_removed)
+        self.server.register_event_handler(
+            "server:gcode_response", self._on_gcode_response)
+        self.server.register_event_handler(
+            "klippy_connection:gcode_received", self._on_gcode_received
+        )
 
         # XXX: The call below is for dev, remove before release
         self._setup_simplyprint_logging()
@@ -111,11 +158,15 @@ class SimplyPrint(Subscribable):
                 5., self._do_connect)
 
     async def _do_connect(self, try_once=False) -> bool:
-        self._logger.info(f"Connecting To SimplyPrint: {self.connect_url}")
+        url = self.connect_url
+        if self.reconnect_token is not None:
+            url = f"{self.connect_url}/{self.reconnect_token}"
+        self._logger.info(f"Connecting To SimplyPrint: {url}")
         while not self.is_closing:
             try:
                 self.ws = await tornado.websocket.websocket_connect(
-                    self.connect_url, connect_timeout=5.,
+                    url, connect_timeout=5.,
+                    ping_interval=15., ping_timeout=45.,
                     on_message_callback=self._on_ws_message)
             except Exception:
                 curtime = self.eventloop.get_loop_time()
@@ -123,11 +174,11 @@ class SimplyPrint(Subscribable):
                 if timediff > CONNECTION_ERROR_LOG_TIME:
                     self.last_err_log_time = curtime
                     logging.exception(
-                        f"Failed to connect to SimplyPrint: {self.connect_url}")
+                        f"Failed to connect to SimplyPrint")
                 if try_once:
                     self.reconnect_hdl = None
                     return False
-                await asyncio.sleep(5.)
+                await asyncio.sleep(self.reconnect_delay)
             else:
                 break
         logging.info("Connected to SimplyPrint Cloud")
@@ -138,12 +189,21 @@ class SimplyPrint(Subscribable):
         if isinstance(message, str):
             self._process_message(message)
         elif message is None and not self.is_closing:
-            logging.info("SimplyPrint Disconnected")
+            reason = code = None
+            if self.ws is not None:
+                reason = self.ws.close_reason
+                code = self.ws.close_code
+            msg = f"SimplyPrint Disconnected - Code: {code}, Reason: {reason}"
+            logging.info(msg)
+            self._logger.info(msg)
             self.connected = False
             self.ws = None
             if self.reconnect_hdl is None:
                 self.reconnect_hdl = self.eventloop.delay_callback(
-                    5., self._do_connect)
+                    self.reconnect_delay, self._do_connect)
+            if self.keepalive_hdl is not None:
+                self.keepalive_hdl.cancel()
+                self.keepalive_hdl = None
 
     def _process_message(self, msg: str) -> None:
         self._logger.info(f"received: {msg}")
@@ -158,10 +218,23 @@ class SimplyPrint(Subscribable):
         if event == "connected":
             logging.info("SimplyPrint Reports Connection Success")
             self.connected = True
+            self.reconnect_token = None
+            if data is not None:
+                interval = data.get("interval")
+                if isinstance(interval, dict):
+                    for key, val in interval.items():
+                        self.intervals[key] = val / 1000.
+                    self._logger.info(f"Intervals Updated: {self.intervals}")
+                self.reconnect_token = data.get("reconnect_token")
+                name = data.get("name")
+                if name is not None:
+                    self._save_item("printer_name", name)
+            self.reconnect_delay = 1.
             self._push_initial_state()
         elif event == "error":
             logging.info(f"SimplyPrint Connection Error: {data}")
-            # TODO: Disconnected and reconnect?
+            self.reconnect_delay = 30.
+            self.reconnect_token = None
         elif event == "new_token":
             if data is None:
                 self._logger.info("Invalid message, no data")
@@ -192,11 +265,41 @@ class SimplyPrint(Subscribable):
                 return
             logging.info(f"SimplyPrint Printer ID Received: {name}")
             self._save_item("printer_name", name)
+        elif event == "demand":
+            if data is None:
+                self._logger.info(f"Invalid message, no data")
+                return
+            demand = data.pop("demand", "unknown")
+            self._process_demand(demand, data)
+        elif event == "interval_change":
+            if isinstance(data, dict):
+                for key, val in data.items():
+                    self.intervals[key] = val / 1000.
+                self._logger.info(f"Intervals Updated: {self.intervals}")
         else:
             # TODO: It would be good for the backend to send an
             # event indicating that it is ready to recieve printer
             # status.
             self._logger.info(f"Unknown event: {msg}")
+
+    def _process_demand(self, demand: str, args: Dict[str, Any]) -> None:
+        kconn: KlippyConnection
+        kconn = self.server.lookup_component("klippy_connection")
+        if not kconn.is_connected():
+            return
+        if demand in ["pause", "resume", "cancel"]:
+            self.eventloop.create_task(self._request_print_action(demand))
+        elif demand == "terminal":
+            if "enabled" in args:
+                self.gcode_terminal_enabled = args["enabled"]
+        elif demand == "gcode":
+            script_list = args.get("list", [])
+            if script_list:
+                script = "\n".join(script_list)
+                coro = self.klippy_apis.run_gcode(script, None)
+                self.eventloop.create_task(coro)
+        else:
+            self._logger.info(f"Unknown demand: {demand}")
 
     def _save_item(self, name: str, data: Any):
         self.sp_info[name] = data
@@ -211,19 +314,38 @@ class SimplyPrint(Subscribable):
             if printer_id is None:
                 self.connect_url = f"{ep}/0/{token}"
             else:
+                self.is_set_up = True
                 self.connect_url = f"{ep}/{printer_id}/{token}"
 
+    async def _request_print_action(self, action: str) -> None:
+        cur_state = self.cache.state
+        ret: Optional[str] = ""
+        if action == "pause":
+            if cur_state == "printing":
+                ret = await self.klippy_apis.pause_print(None)
+        elif action == "resume":
+            if cur_state == "paused":
+                ret = await self.klippy_apis.resume_print(None)
+        elif action == "cancel":
+            if cur_state in ["printing", "paused"]:
+                ret = await self.klippy_apis.cancel_print(None)
+        if ret is None:
+            # Make sure the event fired so we can reset
+            await asyncio.sleep(.05)
+            self._update_state(cur_state)
+
     async def _on_klippy_ready(self):
-        job_state: JobState = self.server.lookup_component("job_state")
-        last_stats: Dict[str, Any] = job_state.get_last_stats()
+        last_stats: Dict[str, Any] = self.job_state.get_last_stats()
         if last_stats["state"] == "printing":
             self._update_state("printing")
         else:
             self._update_state("operational")
-        klippy_apis: KlippyAPI = self.server.lookup_component("klippy_apis")
-        query: Dict[str] = await klippy_apis.query_objects(
+        query: Dict[str] = await self.klippy_apis.query_objects(
             {"heaters": None}, None)
-        sub_objs = {}
+        sub_objs = {
+            "display_status": ["progress"],
+            "bed_mesh": ["mesh_matrix", "mesh_min", "mesh_max"]
+        }
         if query is not None:
             heaters: Dict[str, Any] = query.get("heaters", {})
             avail_htrs: List[str]
@@ -232,8 +354,14 @@ class SimplyPrint(Subscribable):
             for htr in avail_htrs:
                 if htr.startswith("extruder"):
                     sub_objs[htr] = ["temperature", "target"]
+                    if htr == "extruder":
+                        tool_id = "tool0"
+                    else:
+                        tool_id = "tool" + htr[8:]
+                    self.heaters[htr] = tool_id
                 elif htr == "heater_bed":
                     sub_objs[htr] = ["temperature", "target"]
+                    self.heaters[htr] = "bed"
         if not sub_objs:
             return
         status: Dict[str, Any]
@@ -250,13 +378,40 @@ class SimplyPrint(Subscribable):
         if status:
             self._logger.info(f"SimplyPrint: Got Initial Status: {status}")
             self.printer_status = status
-            self._update_temps(status)
+            self._update_temps(1.)
+            self.next_temp_update_time = 0.
+            if "bed_mesh" in status:
+                self._send_mesh_data()
+        self.amb_detect.start()
+        self.printer_info_timer.start(delay=1.)
+
+    def _on_websocket_identified(self, ws: WebSocket) -> None:
+        if (
+            self.cache.current_wsid is None and
+            ws.client_data.get("type", "") == "web"
+        ):
+            ui_data: Dict[str, Any] = {
+                "ui": ws.client_data["name"],
+                "ui_version": ws.client_data["version"]
+            }
+            self.cache.firmware_info.update(ui_data)
+            self.cache.current_wsid = ws.uid
+            self._send_sp("machine_data", ui_data)
+
+    def _on_websocket_removed(self, ws: WebSocket) -> None:
+        if self.cache.current_wsid is None or self.cache.current_wsid != ws.uid:
+            return
+        ui_data = self._get_ui_info()
+        diff = self._get_object_diff(ui_data, self.cache.firmware_info)
+        if diff:
+            self.cache.firmware_info.update(ui_data)
+            self._send_sp("machine_data", ui_data)
 
     def _on_klippy_startup(self, state: str) -> None:
         if state != "ready":
             self._update_state("error")
             self._send_sp("printer_error", None)
-        self._send_sp("connection", "connected")
+        self._send_sp("connection", {"new": "connected"})
         self._send_firmware_data()
 
     def _on_klippy_shutdown(self) -> None:
@@ -264,78 +419,189 @@ class SimplyPrint(Subscribable):
 
     def _on_klippy_disconnected(self) -> None:
         self._update_state("offline")
-        self._send_sp("connection", "disconnected")
-        self.reported_temps = {}
+        self._send_sp("connection", {"new": "disconnected"})
+        self.amb_detect.stop()
+        self.printer_info_timer.stop()
+        self.cache.reset_print_state()
         self.printer_status = {}
 
-    def _on_print_start(self, *args) -> None:
+    def _on_print_start(
+        self, prev_stats: Dict[str, Any], new_stats: Dict[str, Any]
+    ) -> None:
         # inlcludes started and resumed events
         self._update_state("printing")
-        self._send_sp("print_started", None)
+        filename = new_stats["filename"]
+        job_info: Dict[str, Any] = {"filename": filename}
+        fm: FileManager = self.server.lookup_component("file_manager")
+        metadata = fm.get_file_metadata(filename)
+        filament: Optional[float] = metadata.get("filament_total")
+        if filament is not None:
+            job_info["filament"] = round(filament)
+        est_time = self.cache.metadata.get("estimated_time")
+        if est_time is not None:
+            job_info["time"] = est_time
+        self.cache.metadata = metadata
+        self.cache.job_info.update(job_info)
+        job_info["started"] = True
+        self._send_job_event(job_info)
 
     def _on_print_paused(self, *args) -> None:
+        self._send_sp("job_info", {"paused": True})
         self._update_state("paused")
-        self._send_sp("print_paused", None)
+
+    def _on_print_resumed(self, *args) -> None:
+        self._update_state("printing")
 
     def _on_print_cancelled(self, *args) -> None:
-        # TODO: Update State (translate from Klippy), send
-        # print_cancelled event
+        self._send_job_event({"cancelled": True})
         self._update_state_from_klippy()
-        self._send_sp("print_cancelled", None)
+        self.cache.job_info = {}
 
     def _on_print_error(self, *args) -> None:
+        self._send_job_event({"failed": True})
         self._update_state_from_klippy()
-        self._send_sp("print_failure", None)
+        self.cache.job_info = {}
 
     def _on_print_complete(self, *args) -> None:
+        self._send_job_event({"finished": True})
         self._update_state_from_klippy()
-        self._send_sp("print_done", None)
+        self.cache.job_info = {}
 
     def _on_print_standby(self, *args) -> None:
         self._update_state_from_klippy()
+        self.cache.job_info = {}
+
+    def _on_pause_requested(self) -> None:
+        if self.cache.state == "printing":
+            self._update_state("pausing")
+
+    def _on_resume_requested(self) -> None:
+        if self.cache.state == "paused":
+            self._update_state("resuming")
+
+    def _on_cancel_requested(self) -> None:
+        if self.cache.state in ["printing", "paused", "pausing"]:
+            self._update_state("cancelling")
+
+    def _on_gcode_response(self, response: str):
+        if self.gcode_terminal_enabled:
+            resp = [
+                r.strip() for r in response.strip().split("\n") if r.strip()
+            ]
+            self._send_sp("term_update", {"response": resp})
+
+    def _on_gcode_received(self, script: str):
+        if self.gcode_terminal_enabled:
+            cmds = [s.strip() for s in script.strip().split() if s.strip()]
+            self._send_sp("term_update", {"command": cmds})
+
+    def _on_proc_update(self, proc_stats: Dict[str, Any]) -> None:
+        cpu = proc_stats["system_cpu_usage"]
+        if not cpu:
+            return
+        curtime = self.eventloop.get_loop_time()
+        if curtime - self.last_cpu_update_time < self.intervals["cpu"]:
+            return
+        self.last_cpu_update_time = curtime
+        sys_mem = proc_stats["system_memory"]
+        mem_pct: float = 0.
+        if sys_mem:
+            mem_pct = sys_mem["used"] / sys_mem["total"] * 100
+        cpu_data = {
+            "usage": int(cpu["cpu"] + .5),
+            "temp": int(proc_stats["cpu_temp"] + .5),
+            "memory": int(mem_pct + .5)
+        }
+        diff = self._get_object_diff(cpu_data, self.cache.cpu_info)
+        if diff:
+            self.cache.cpu_info = cpu_data
+            self._send_sp("cpu", diff)
+
+    def _on_ambient_changed(self, new_ambient: int) -> None:
+        self._save_item("ambient_temp", new_ambient)
+        self._send_sp("ambient", {"new": new_ambient})
 
     def send_status(self, status: Dict[str, Any], eventtime: float) -> None:
-        self._update_temps(status)
+        for printer_obj, vals in status.items():
+            self.printer_status[printer_obj].update(vals)
+        self._update_temps(eventtime)
+        if "bed_mesh" in status:
+            self._send_mesh_data()
 
-    def _update_temps(self, new_status: Dict[str, Dict[str, Any]]) -> None:
-        cur_time = self.eventloop.get_loop_time()
-        if cur_time - self.last_temp_update_time < 1.:
-            return
-        temp_data: Dict[str, List[int]] = {}
-        for heater, vals in new_status.items():
-            if heater == "heater_bed":
-                key = "bed"
-            elif heater.startswith("extruder"):
-                key = "tool"
-                postfix = heater[8:]
-                if postfix.isdigit():
-                    key += postfix
-                else:
-                    key += "0"
-            else:
-                continue
-            self.printer_status[heater].update(vals)
-            reported_temp = self.printer_status[heater]["temperature"]
-            ret = [int(reported_temp + .5)]
-            target = int(self.printer_status[heater]["target"] + .5)
-            if target:
-                ret.append(target)
-            last_temps = self.reported_temps.get(key, [])
+    def _handle_printer_info_update(self, eventtime: float) -> float:
+        # Job Info Timer handler
+        if self.cache.state == "printing":
+            self._update_job_progress()
+            return eventtime + 1.
+        return eventtime + self.intervals["job"]
+
+    def _update_job_progress(self) -> None:
+        job_info: Dict[str, Any] = {}
+        est_time = self.cache.metadata.get("estimated_time")
+        if est_time is not None:
+            last_stats: Dict[str, Any] = self.job_state.get_last_stats()
+            duration: float = last_stats["print_duration"]
+            time_left = max(0, int(est_time - duration + .5))
+            last_time_left = self.cache.job_info.get("time", time_left + 60.)
+            time_diff = last_time_left - time_left
             if (
-                len(ret) == len(last_temps) and
-                key in self.last_received_temps
+                (time_left < 60 or time_diff >= 30) and
+                time_left != last_time_left
             ):
-                last_reported = self.last_received_temps[key]
-                if abs(reported_temp - last_reported) < .5:
-                    self.last_received_temps.pop(key)
+                job_info["time"] = time_left
+        if "display_status" in self.printer_status:
+            progress = self.printer_status["display_status"]["progress"]
+            pct_prog = int(progress * 100 + .5)
+            if pct_prog != self.cache.job_info.get("progress", 0):
+                job_info["progress"] = int(progress * 100 + .5)
+        if job_info:
+            self.cache.job_info.update(job_info)
+            self._send_sp("job_info", job_info)
+
+    def _update_temps(self, eventtime: float) -> None:
+        if eventtime < self.next_temp_update_time:
+            return
+        need_rapid_update: bool = False
+        temp_data: Dict[str, List[int]] = {}
+        for printer_obj, key in self.heaters.items():
+            reported_temp = self.printer_status[printer_obj]["temperature"]
+            ret = [
+                int(reported_temp + .5),
+                int(self.printer_status[printer_obj]["target"] + .5)
+            ]
+            last_temps = self.cache.temps.get(key, [-100., -100.])
+            if ret[1] == last_temps[1]:
+                if ret[1]:
+                    seeking_target = abs(ret[1] - ret[0]) > 5
+                else:
+                    seeking_target = ret[0] >= self.amb_detect.ambient + 25
+                need_rapid_update |= seeking_target
+                # The target hasn't changed and not heating, debounce temp
+                if key in self.last_received_temps and not seeking_target:
+                    last_reported = self.last_received_temps[key]
+                    if abs(reported_temp - last_reported) < .75:
+                        self.last_received_temps.pop(key)
+                        continue
+                if ret[0] == last_temps[0]:
+                    self.last_received_temps[key] = reported_temp
                     continue
+                temp_data[key] = ret[:1]
+            else:
+                # target has changed, send full data
+                temp_data[key] = ret
             self.last_received_temps[key] = reported_temp
-            self.reported_temps[key] = ret
-            temp_data[key] = ret
+            self.cache.temps[key] = ret
+        if need_rapid_update:
+            self.next_temp_update_time = (
+                0. if self.intervals["temps_target"] < .2501 else
+                eventtime + self.intervals["temps_target"]
+            )
+        else:
+            self.next_temp_update_time = eventtime + self.intervals["temps"]
         if not temp_data:
             return
-        self.last_temp_update_time = cur_time
-        self._send_sp("temps", temp_data)
+        if self.is_set_up:
+            self._send_sp("temps", temp_data)
 
     def _update_state_from_klippy(self) -> None:
         kstate = self.server.get_klippy_state()
@@ -348,23 +614,43 @@ class SimplyPrint(Subscribable):
         self._update_state(sp_state)
 
     def _update_state(self, new_state: str) -> None:
-        if self.reported_state == new_state:
+        if self.cache.state == new_state:
             return
-        self.reported_state = new_state
+        self.cache.state = new_state
         self._send_sp("state_change", {"new": new_state})
 
-    async def _send_printer_data(self):
-        data: Dict[str, Any] = {}
-        app_args = self.server.get_app_args()
-        data["ui"] = None
-        data["ui_version"] = None
+    def _send_mesh_data(self) -> None:
+        mesh = self.printer_status["bed_mesh"]
+        # TODO: We are probably going to have to reformat the mesh
+        self.cache.mesh = mesh
+        self._send_sp("mesh_data", mesh)
+
+    def _send_job_event(self, job_info: Dict[str, Any]) -> None:
+        if self.connected:
+            self._send_sp("job_info", job_info)
+        else:
+            job_info.update(self.cache.job_info)
+            job_info["delay"] = self.eventloop.get_loop_time()
+            self.missed_job_events.append(job_info)
+            if len(self.missed_job_events) > 10:
+                self.missed_job_events.pop(0)
+
+    def _get_ui_info(self) -> Dict[str, Any]:
+        ui_data: Dict[str, Any] = {"ui": None, "ui_version": None}
+        self.cache.current_wsid = None
         websockets: WebsocketManager
         websockets = self.server.lookup_component("websockets")
         conns = websockets.get_websockets_by_type("web")
         if conns:
             longest = conns[0]
-            data["ui"] = longest.client_data["client_name"]
-            data["ui_version"] = longest.client_data["version"]
+            ui_data["ui"] = longest.client_data["name"]
+            ui_data["ui_version"] = longest.client_data["version"]
+            self.cache.current_wsid = longest.uid
+        return ui_data
+
+    async def _send_machine_data(self):
+        app_args = self.server.get_app_args()
+        data = self._get_ui_info()
         data["api"] = "Moonraker"
         data["api_version"] = app_args["software_version"]
         data["sp_version"] = COMPONENT_VERSION
@@ -379,44 +665,67 @@ class SimplyPrint(Subscribable):
         data["os"] = sys_info["distribution"].get("name", "Unknown")
         pub_intf = await machine.get_public_network()
         data["is_ethernet"] = int(not pub_intf["is_wifi"])
-        data["wifi_ssid"] = pub_intf.get("ssid", "")
+        data["ssid"] = pub_intf.get("ssid", "")
         data["local_ip"] = pub_intf.get("address", "Unknown")
         data["hostname"] = pub_intf["hostname"]
         self._logger.info(f"calculated machine data: {data}")
-        self._send_sp("machine_data", data)
+        diff = self._get_object_diff(data, self.cache.machine_info)
+        if diff:
+            self.cache.machine_info = data
+            self._send_sp("machine_data", diff)
 
     def _send_firmware_data(self):
         kinfo = self.server.get_klippy_info()
-        if not kinfo:
+        if "software_version" not in kinfo:
             return
-        fimrware_date: str = ""
+        firmware_date: str = ""
         # Approximate the firmware "date" using the last modified
         # time of the Klippy source folder
         kpath = pathlib.Path(kinfo["klipper_path"]).joinpath("klippy")
         if kpath.is_dir():
             mtime = kpath.stat().st_mtime
-            fimrware_date = time.asctime(time.gmtime(mtime))
-        version: str = kinfo["sofware_version"]
+            firmware_date = time.asctime(time.gmtime(mtime))
+        version: str = kinfo["software_version"]
         unsafe = version.endswith("-dirty") or version == "?"
         if unsafe:
             version = version.rsplit("-", 1)[0]
         fw_info = {
             "firmware": "Klipper",
             "firmware_version": version,
-            "firmware_date": fimrware_date,
+            "firmware_date": firmware_date,
             "firmware_link": "https://github.com/Klipper3d/klipper",
             "firmware_unsafe": unsafe
         }
-        self._send_sp("firmware_data", fw_info)
+        diff = self._get_object_diff(fw_info, self.cache.firmware_info)
+        if diff:
+            self.cache.firmware_info = fw_info
+            self._send_sp("firmware", {"fw": diff, "raw": False})
 
     def _push_initial_state(self):
         # TODO: This method is called after SP is connected
-        # and ready to receive state.  We need to determine
-        # if we should
-        self._send_sp("state_change", {"new": self.reported_state})
-        if self.reported_temps:
-            self._send_sp("temps", self.reported_temps)
-        self.eventloop.create_task(self._send_printer_data())
+        # and ready to receive state.  We need a list of items
+        # we can safely send if the printer is not setup (ie: has no
+        # printer ID)
+        #
+        # The firmware data and machine data is likely saved by
+        # simplyprint.  It might be better for SP to request it
+        # rather than for the client to send it on every connection.
+        self._send_sp("state_change", {"new": self.cache.state})
+        if self.cache.temps and self.is_set_up:
+            self._send_sp("temps", self.cache.temps)
+        if self.cache.firmware_info:
+            self._send_sp(
+                "firmware",
+                {"fw": self.cache.firmware_info, "raw": False})
+        curtime = self.eventloop.get_loop_time()
+        for evt in self.missed_job_events:
+            evt["delay"] = int((curtime - evt["delay"]) + .5)
+            self._send_sp("job_info", evt)
+        self.missed_job_events = []
+        if self.cache.cpu_info:
+            self._send_sp("cpu_info", self.cache.cpu_info)
+        self._send_sp("ambient", {"new": self.amb_detect.ambient})
+        self.eventloop.create_task(self._send_machine_data())
 
     def _send_sp(self, evt_name: str, data: Any) -> asyncio.Future:
         if not self.connected or self.ws is None:
@@ -459,9 +768,23 @@ class SimplyPrint(Subscribable):
         self.qlistner = logging.handlers.QueueListener(queue, file_hdlr)
         self.qlistner.start()
 
+    def _get_object_diff(
+        self, new_obj: Dict[str, Any], cached_obj: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if not cached_obj:
+            return new_obj
+        diff: Dict[str, Any] = {}
+        for key, val in new_obj.items():
+            if key in cached_obj and val == cached_obj[key]:
+                continue
+            diff[key] = val
+        return diff
+
     async def close(self):
         await self._send_sp("shutdown", None)
         self.qlistner.stop()
+        self.amb_detect.stop()
+        self.printer_info_timer.stop()
         self.is_closing = True
         if self.reconnect_hdl is not None:
             # TODO, would be good to cancel the reconnect task as well
@@ -471,6 +794,97 @@ class SimplyPrint(Subscribable):
             self.keepalive_hdl = None
         if self.ws is not None:
             self.ws.close()
+
+class ReportCache:
+    def __init__(self) -> None:
+        self.state = "offline"
+        self.temps: Dict[str, Any] = {}
+        self.metadata: Dict[str, Any] = {}
+        self.mesh: Dict[str, Any] = {}
+        self.job_info: Dict[str, Any] = {}
+        # Persistent state across connections
+        self.firmware_info: Dict[str, Any] = {}
+        self.machine_info: Dict[str, Any] = {}
+        self.cpu_info: Dict[str, Any] = {}
+        self.current_wsid: Optional[int] = None
+
+    def reset_print_state(self) -> None:
+        self.temps = {}
+        self.mesh = {}
+        self.job_info = {}
+
+
+INITIAL_AMBIENT = 85
+AMBIENT_CHECK_TIME = 5. * 60.
+TARGET_CHECK_TIME = 60. * 60.
+SAMPLE_CHECK_TIME = 20.
+
+class AmbientDetect:
+    CHECK_INTERVAL = 5
+    def __init__(
+        self,
+        config: ConfigHelper,
+        cache: ReportCache,
+        changed_cb: Callable[[int], None],
+        initial_ambient: int
+    ) -> None:
+        self.server = config.get_server()
+        self.cache = cache
+        self._initial_sample: int = -1000
+        self._ambient = initial_ambient
+        self._on_ambient_changed = changed_cb
+        self._last_sample_time: float = 0.
+        self._update_interval = AMBIENT_CHECK_TIME
+        eventloop = self.server.get_event_loop()
+        self._detect_timer = eventloop.register_timer(self._handle_detect_timer)
+
+    @property
+    def ambient(self) -> int:
+        return self._ambient
+
+    def _handle_detect_timer(self, eventtime: float) -> float:
+        if "tool0" not in self.cache.temps:
+            self._initial_sample = -1000
+            return eventtime + self.CHECK_INTERVAL
+        temp, target = self.cache.temps["tool0"]
+        if target:
+            self._initial_sample = -1000
+            self._last_sample_time = eventtime
+            self._update_interval = TARGET_CHECK_TIME
+            return eventtime + self.CHECK_INTERVAL
+        if eventtime - self._last_sample_time < self._update_interval:
+            return eventtime + self.CHECK_INTERVAL
+        if self._initial_sample == -1000:
+            self._initial_sample = temp
+            self._update_interval = SAMPLE_CHECK_TIME
+        else:
+            diff = abs(temp - self._initial_sample)
+            if diff <= 2:
+                last_ambient = self._ambient
+                self._ambient = int((temp + self._initial_sample) / 2 + .5)
+                self._initial_sample = -1000
+                self._last_sample_time = eventtime
+                self._update_interval = AMBIENT_CHECK_TIME
+                if last_ambient != self._ambient:
+                    logging.debug(f"SimplyPrint: New Ambient: {self._ambient}")
+                    self._on_ambient_changed(self._ambient)
+            else:
+                self._initial_sample = temp
+                self._update_interval = SAMPLE_CHECK_TIME
+        return eventtime + self.CHECK_INTERVAL
+
+    def start(self) -> None:
+        if self._detect_timer.is_running():
+            return
+        if "tool0" in self.cache.temps:
+            cur_temp = self.cache.temps["tool0"][0]
+            if cur_temp < self._ambient:
+                self._ambient = cur_temp
+                self._on_ambient_changed(self._ambient)
+        self._detect_timer.start()
+
+    def stop(self) -> None:
+        self._detect_timer.stop()
 
 def load_component(config: ConfigHelper) -> SimplyPrint:
     return SimplyPrint(config)
