@@ -344,7 +344,9 @@ class SimplyPrint(Subscribable):
             {"heaters": None}, None)
         sub_objs = {
             "display_status": ["progress"],
-            "bed_mesh": ["mesh_matrix", "mesh_min", "mesh_max"]
+            "bed_mesh": ["mesh_matrix", "mesh_min", "mesh_max"],
+            "toolhead": ["extruder"],
+            "gcode_move": ["gcode_position"]
         }
         if query is not None:
             heaters: Dict[str, Any] = query.get("heaters", {})
@@ -382,6 +384,8 @@ class SimplyPrint(Subscribable):
             self.next_temp_update_time = 0.
             if "bed_mesh" in status:
                 self._send_mesh_data()
+            if "toolhead" in status:
+                self._send_active_extruder(status["toolhead"]["extruder"])
         self.amb_detect.start()
         self.printer_info_timer.start(delay=1.)
 
@@ -527,6 +531,8 @@ class SimplyPrint(Subscribable):
         self._update_temps(eventtime)
         if "bed_mesh" in status:
             self._send_mesh_data()
+        if "toolhead" in status and "extruder" in status["toolhead"]:
+            self._send_active_extruder(status["toolhead"]["extruder"])
 
     def _handle_printer_info_update(self, eventtime: float) -> float:
         # Job Info Timer handler
@@ -701,6 +707,13 @@ class SimplyPrint(Subscribable):
             self.cache.firmware_info = fw_info
             self._send_sp("firmware", {"fw": diff, "raw": False})
 
+    def _send_active_extruder(self, new_extruder: str):
+        tool = "T0" if new_extruder == "extruder" else f"T{new_extruder[8:]}"
+        if tool == self.cache.active_extruder:
+            return
+        self.cache.active_extruder = tool
+        self._send_sp("tool", {"new": tool})
+
     def _push_initial_state(self):
         # TODO: This method is called after SP is connected
         # and ready to receive state.  We need a list of items
@@ -721,6 +734,8 @@ class SimplyPrint(Subscribable):
         for evt in self.missed_job_events:
             evt["delay"] = int((curtime - evt["delay"]) + .5)
             self._send_sp("job_info", evt)
+        if self.cache.active_extruder:
+            self._send_sp("tool", {"new": self.cache.active_extruder})
         self.missed_job_events = []
         if self.cache.cpu_info:
             self._send_sp("cpu_info", self.cache.cpu_info)
@@ -802,6 +817,7 @@ class ReportCache:
         self.metadata: Dict[str, Any] = {}
         self.mesh: Dict[str, Any] = {}
         self.job_info: Dict[str, Any] = {}
+        self.active_extruder: str = ""
         # Persistent state across connections
         self.firmware_info: Dict[str, Any] = {}
         self.machine_info: Dict[str, Any] = {}
