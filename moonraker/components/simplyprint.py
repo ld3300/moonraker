@@ -69,6 +69,7 @@ class SimplyPrint(Subscribable):
             config, self.cache, self._on_ambient_changed,
             self.sp_info.get("ambient_temp", INITIAL_AMBIENT)
         )
+        self.layer_detect = LayerDetect()
         self.last_received_temps: Dict[str, float] = {}
         self.last_err_log_time: float = 0.
         self.last_cpu_update_time: float = 0.
@@ -337,7 +338,7 @@ class SimplyPrint(Subscribable):
     async def _on_klippy_ready(self):
         last_stats: Dict[str, Any] = self.job_state.get_last_stats()
         if last_stats["state"] == "printing":
-            self._update_state("printing")
+            self._on_print_start(last_stats, last_stats, False)
         else:
             self._update_state("operational")
         query: Dict[str] = await self.klippy_apis.query_objects(
@@ -386,6 +387,10 @@ class SimplyPrint(Subscribable):
                 self._send_mesh_data()
             if "toolhead" in status:
                 self._send_active_extruder(status["toolhead"]["extruder"])
+            if "gcode_move" in status:
+                self.layer_detect.update(
+                    status["gcode_move"]["gcode_position"]
+                )
         self.amb_detect.start()
         self.printer_info_timer.start(delay=1.)
 
@@ -430,7 +435,10 @@ class SimplyPrint(Subscribable):
         self.printer_status = {}
 
     def _on_print_start(
-        self, prev_stats: Dict[str, Any], new_stats: Dict[str, Any]
+        self,
+        prev_stats: Dict[str, Any],
+        new_stats: Dict[str, Any],
+        need_start_event: bool = True
     ) -> None:
         # inlcludes started and resumed events
         self._update_state("printing")
@@ -446,34 +454,42 @@ class SimplyPrint(Subscribable):
             job_info["time"] = est_time
         self.cache.metadata = metadata
         self.cache.job_info.update(job_info)
-        job_info["started"] = True
+        if need_start_event:
+            job_info["started"] = True
+        self.layer_detect.start(metadata)
         self._send_job_event(job_info)
 
     def _on_print_paused(self, *args) -> None:
         self._send_sp("job_info", {"paused": True})
         self._update_state("paused")
+        self.layer_detect.stop()
 
     def _on_print_resumed(self, *args) -> None:
         self._update_state("printing")
+        self.layer_detect.resume()
 
     def _on_print_cancelled(self, *args) -> None:
         self._send_job_event({"cancelled": True})
         self._update_state_from_klippy()
         self.cache.job_info = {}
+        self.layer_detect.stop()
 
     def _on_print_error(self, *args) -> None:
         self._send_job_event({"failed": True})
         self._update_state_from_klippy()
         self.cache.job_info = {}
+        self.layer_detect.stop()
 
     def _on_print_complete(self, *args) -> None:
         self._send_job_event({"finished": True})
         self._update_state_from_klippy()
         self.cache.job_info = {}
+        self.layer_detect.stop()
 
     def _on_print_standby(self, *args) -> None:
         self._update_state_from_klippy()
         self.cache.job_info = {}
+        self.layer_detect.stop()
 
     def _on_pause_requested(self) -> None:
         if self.cache.state == "printing":
@@ -533,6 +549,8 @@ class SimplyPrint(Subscribable):
             self._send_mesh_data()
         if "toolhead" in status and "extruder" in status["toolhead"]:
             self._send_active_extruder(status["toolhead"]["extruder"])
+        if "gcode_move" in status:
+            self.layer_detect.update(status["gcode_move"]["gcode_position"])
 
     def _handle_printer_info_update(self, eventtime: float) -> float:
         # Job Info Timer handler
@@ -560,6 +578,9 @@ class SimplyPrint(Subscribable):
             pct_prog = int(progress * 100 + .5)
             if pct_prog != self.cache.job_info.get("progress", 0):
                 job_info["progress"] = int(progress * 100 + .5)
+        layer = self.layer_detect.layer
+        if layer != self.cache.job_info.get("layer", -1):
+            job_info["layer"] = layer
         if job_info:
             self.cache.job_info.update(job_info)
             self._send_sp("job_info", job_info)
@@ -901,6 +922,57 @@ class AmbientDetect:
 
     def stop(self) -> None:
         self._detect_timer.stop()
+
+class LayerDetect:
+    def __init__(self) -> None:
+        self._layer: int = 0
+        self._layer_z: float = 0.
+        self._active: bool = False
+        self._layer_height: float = 0.
+        self._fl_height: float = 0.
+        self._layer_count: int = 99999999999
+
+    @property
+    def layer(self) -> int:
+        return self._layer
+
+    def update(self, new_pos: List[float]) -> None:
+        if not self._active or self._layer_z == new_pos[2]:
+            return
+        layer = 1 + int(
+            (new_pos[2] - self._fl_height) / self._layer_height + .5
+        )
+        self._layer = min(layer, self._layer_count)
+        self._layer_z = new_pos[2]
+
+    def start(self, metadata: Dict[str, Any]) -> None:
+        self.reset()
+        lh: Optional[float] = metadata.get("layer_height")
+        flh: Optional[float] = metadata.get("first_layer_height", lh)
+        if lh is not None and flh is not None:
+            self._active = True
+            self._layer_height = lh
+            self._fl_height = flh
+            layer_count: Optional[int] = metadata.get("layer_count")
+            obj_height: Optional[float] = metadata.get("object_height")
+            if layer_count is not None:
+                self._layer_count = layer_count
+            elif obj_height is not None:
+                self._layer_count = int((obj_height - flh) / lh + .5)
+
+    def resume(self) -> None:
+        self._active = True
+
+    def stop(self) -> None:
+        self._active = False
+
+    def reset(self) -> None:
+        self._active = False
+        self._layer = 0
+        self._layer_z = 0.
+        self._layer_height = 0.
+        self._fl_height = 0.
+        self._layer_count = 99999999999
 
 def load_component(config: ConfigHelper) -> SimplyPrint:
     return SimplyPrint(config)
