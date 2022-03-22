@@ -89,6 +89,7 @@ class SimplyPrint(Subscribable):
         self.printer_info_timer = self.eventloop.register_timer(
             self._handle_printer_info_update)
         self.next_temp_update_time: float = 0.
+        self._last_pong: float = 0.
         self.gcode_terminal_enabled: bool = False
         self.connected = False
         self.is_set_up = False
@@ -169,6 +170,8 @@ class SimplyPrint(Subscribable):
                     url, connect_timeout=5.,
                     ping_interval=15., ping_timeout=45.,
                     on_message_callback=self._on_ws_message)
+                setattr(self.ws, "on_pong", self._on_ws_pong)
+                self._last_pong = self.eventloop.get_loop_time()
             except Exception:
                 curtime = self.eventloop.get_loop_time()
                 timediff = curtime - self.last_err_log_time
@@ -190,11 +193,15 @@ class SimplyPrint(Subscribable):
         if isinstance(message, str):
             self._process_message(message)
         elif message is None and not self.is_closing:
+            pong_time: float = self.eventloop.get_loop_time() - self._last_pong
             reason = code = None
             if self.ws is not None:
                 reason = self.ws.close_reason
                 code = self.ws.close_code
-            msg = f"SimplyPrint Disconnected - Code: {code}, Reason: {reason}"
+            msg = (
+                f"SimplyPrint Disconnected - Code: {code}, Reason: {reason}, "
+                f"Pong Time Elapsed: {pong_time}"
+            )
             logging.info(msg)
             self._logger.info(msg)
             self.connected = False
@@ -205,6 +212,9 @@ class SimplyPrint(Subscribable):
             if self.keepalive_hdl is not None:
                 self.keepalive_hdl.cancel()
                 self.keepalive_hdl = None
+
+    def _on_ws_pong(self, data: bytes = b"") -> None:
+        self._last_pong = self.eventloop.get_loop_time()
 
     def _process_message(self, msg: str) -> None:
         self._logger.info(f"received: {msg}")
@@ -828,7 +838,7 @@ class SimplyPrint(Subscribable):
             self.keepalive_hdl.cancel()
             self.keepalive_hdl = None
         if self.ws is not None:
-            self.ws.close()
+            self.ws.close(1001, "Client Shutdown")
 
 class ReportCache:
     def __init__(self) -> None:
