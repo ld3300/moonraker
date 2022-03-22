@@ -89,7 +89,6 @@ class SimplyPrint(Subscribable):
         self.printer_info_timer = self.eventloop.register_timer(
             self._handle_printer_info_update)
         self.next_temp_update_time: float = 0.
-        self._last_pong: float = 0.
         self._last_ping_received: float = 0.
         self.gcode_terminal_enabled: bool = False
         self.connected = False
@@ -170,10 +169,9 @@ class SimplyPrint(Subscribable):
                 self.ws = await tornado.websocket.websocket_connect(
                     url, connect_timeout=5.,
                     on_message_callback=self._on_ws_message)
-                setattr(self.ws, "on_pong", self._on_ws_pong)
                 setattr(self.ws, "on_ping", self._on_ws_ping)
-                self._last_pong = self.eventloop.get_loop_time()
-                self._last_ping_received = self._last_pong
+                cur_time = self.eventloop.get_loop_time()
+                self._last_ping_received = cur_time
             except Exception:
                 curtime = self.eventloop.get_loop_time()
                 timediff = curtime - self.last_err_log_time
@@ -196,7 +194,6 @@ class SimplyPrint(Subscribable):
             self._process_message(message)
         elif message is None and not self.is_closing:
             cur_time = self.eventloop.get_loop_time()
-            pong_time: float = cur_time - self._last_pong
             ping_time: float = cur_time - self._last_ping_received
             reason = code = None
             if self.ws is not None:
@@ -204,8 +201,7 @@ class SimplyPrint(Subscribable):
                 code = self.ws.close_code
             msg = (
                 f"SimplyPrint Disconnected - Code: {code}, Reason: {reason}, "
-                f"Pong Time Elapsed: {pong_time}, Server Ping Time Elapsed: "
-                f"{ping_time}"
+                f"Server Ping Time Elapsed: {ping_time}"
             )
             logging.info(msg)
             self._logger.info(msg)
@@ -217,9 +213,6 @@ class SimplyPrint(Subscribable):
             if self.keepalive_hdl is not None:
                 self.keepalive_hdl.cancel()
                 self.keepalive_hdl = None
-
-    def _on_ws_pong(self, data: bytes = b"") -> None:
-        self._last_pong = self.eventloop.get_loop_time()
 
     def _on_ws_ping(self, data: bytes = b"") -> None:
         self._last_ping_received = self.eventloop.get_loop_time()
