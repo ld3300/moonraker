@@ -449,7 +449,7 @@ class SimplyPrint(Subscribable):
         filament: Optional[float] = metadata.get("filament_total")
         if filament is not None:
             job_info["filament"] = round(filament)
-        est_time = self.cache.metadata.get("estimated_time")
+        est_time = metadata.get("estimated_time")
         if est_time is not None:
             job_info["time"] = est_time
         self.cache.metadata = metadata
@@ -556,7 +556,6 @@ class SimplyPrint(Subscribable):
         # Job Info Timer handler
         if self.cache.state == "printing":
             self._update_job_progress()
-            return eventtime + 1.
         return eventtime + self.intervals["job"]
 
     def _update_job_progress(self) -> None:
@@ -931,6 +930,7 @@ class LayerDetect:
         self._layer_height: float = 0.
         self._fl_height: float = 0.
         self._layer_count: int = 99999999999
+        self._check_next: bool = False
 
     @property
     def layer(self) -> int:
@@ -938,7 +938,13 @@ class LayerDetect:
 
     def update(self, new_pos: List[float]) -> None:
         if not self._active or self._layer_z == new_pos[2]:
+            self._check_next = False
             return
+        if not self._check_next:
+            # Try to avoid z-hops by skipping the first detected change
+            self._check_next = True
+            return
+        self._check_next = False
         layer = 1 + int(
             (new_pos[2] - self._fl_height) / self._layer_height + .5
         )
@@ -973,6 +979,7 @@ class LayerDetect:
         self._layer_height = 0.
         self._fl_height = 0.
         self._layer_count = 99999999999
+        self._check_next = False
 
 def load_component(config: ConfigHelper) -> SimplyPrint:
     return SimplyPrint(config)
