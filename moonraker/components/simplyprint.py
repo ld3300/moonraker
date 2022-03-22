@@ -90,6 +90,7 @@ class SimplyPrint(Subscribable):
             self._handle_printer_info_update)
         self.next_temp_update_time: float = 0.
         self._last_pong: float = 0.
+        self._last_ping_received: float = 0.
         self.gcode_terminal_enabled: bool = False
         self.connected = False
         self.is_set_up = False
@@ -168,10 +169,11 @@ class SimplyPrint(Subscribable):
             try:
                 self.ws = await tornado.websocket.websocket_connect(
                     url, connect_timeout=5.,
-                    ping_interval=15., ping_timeout=45.,
                     on_message_callback=self._on_ws_message)
                 setattr(self.ws, "on_pong", self._on_ws_pong)
+                setattr(self.ws, "on_ping", self._on_ws_ping)
                 self._last_pong = self.eventloop.get_loop_time()
+                self._last_ping_received = self._last_pong
             except Exception:
                 curtime = self.eventloop.get_loop_time()
                 timediff = curtime - self.last_err_log_time
@@ -193,14 +195,17 @@ class SimplyPrint(Subscribable):
         if isinstance(message, str):
             self._process_message(message)
         elif message is None and not self.is_closing:
-            pong_time: float = self.eventloop.get_loop_time() - self._last_pong
+            cur_time = self.eventloop.get_loop_time()
+            pong_time: float = cur_time - self._last_pong
+            ping_time: float = cur_time - self._last_ping_received
             reason = code = None
             if self.ws is not None:
                 reason = self.ws.close_reason
                 code = self.ws.close_code
             msg = (
                 f"SimplyPrint Disconnected - Code: {code}, Reason: {reason}, "
-                f"Pong Time Elapsed: {pong_time}"
+                f"Pong Time Elapsed: {pong_time}, Server Ping Time Elapsed: "
+                f"{ping_time}"
             )
             logging.info(msg)
             self._logger.info(msg)
@@ -215,6 +220,9 @@ class SimplyPrint(Subscribable):
 
     def _on_ws_pong(self, data: bytes = b"") -> None:
         self._last_pong = self.eventloop.get_loop_time()
+
+    def _on_ws_ping(self, data: bytes = b"") -> None:
+        self._last_ping_received = self.eventloop.get_loop_time()
 
     def _process_message(self, msg: str) -> None:
         self._logger.info(f"received: {msg}")
