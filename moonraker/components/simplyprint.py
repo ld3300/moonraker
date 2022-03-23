@@ -134,6 +134,9 @@ class SimplyPrint(Subscribable):
         self.server.register_event_handler(
             "proc_stats:proc_stat_update", self._on_proc_update)
         self.server.register_event_handler(
+            "proc_stats:cpu_throttled", self._on_cpu_throttled
+        )
+        self.server.register_event_handler(
             "websockets:websocket_identified",
             self._on_websocket_identified)
         self.server.register_event_handler(
@@ -541,12 +544,16 @@ class SimplyPrint(Subscribable):
         cpu_data = {
             "usage": int(cpu["cpu"] + .5),
             "temp": int(proc_stats["cpu_temp"] + .5),
-            "memory": int(mem_pct + .5)
+            "memory": int(mem_pct + .5),
+            "flags": self.cache.throttled_state.get("bits", 0)
         }
         diff = self._get_object_diff(cpu_data, self.cache.cpu_info)
         if diff:
-            self.cache.cpu_info = cpu_data
+            self.cache.cpu_info.update(cpu_data)
             self._send_sp("cpu", diff)
+
+    def _on_cpu_throttled(self, throttled_state: Dict[str, Any]):
+        self.cache.throttled_state = throttled_state
 
     def _on_ambient_changed(self, new_ambient: int) -> None:
         self._save_item("ambient_temp", new_ambient)
@@ -853,6 +860,7 @@ class ReportCache:
         self.firmware_info: Dict[str, Any] = {}
         self.machine_info: Dict[str, Any] = {}
         self.cpu_info: Dict[str, Any] = {}
+        self.throttled_state: Dict[str, Any] = {}
         self.current_wsid: Optional[int] = None
 
     def reset_print_state(self) -> None:
