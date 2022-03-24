@@ -53,6 +53,7 @@ class SimplyPrint(Subscribable):
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.eventloop = self.server.get_event_loop()
+        self.webcam_name = config.get("webcam_name", "")
         self.job_state: JobState
         self.job_state = self.server.lookup_component("job_state")
         self.klippy_apis: KlippyAPI
@@ -752,6 +753,27 @@ class SimplyPrint(Subscribable):
         self.cache.active_extruder = tool
         self._send_sp("tool", {"new": tool})
 
+    async def _send_webcam_config(self) -> None:
+        db: MoonrakerDatabase = self.server.lookup_component("database")
+        webcams: Dict[str, Dict[str, Any]]
+        webcams = await db.get_item("webcams", default={})
+        if not webcams:
+            return
+        wc_cfg: Dict[str, Any] = webcams[list(webcams.keys())[0]]
+        if not self.webcam_name:
+            wc_cfg = webcams[list(webcams.keys())[0]]
+        else:
+            for cfg in webcams.values():
+                if cfg.get("name", "") == self.webcam_name:
+                    wc_cfg = cfg
+                    break
+        wc_data = {
+            "flipH": wc_cfg.get("flipX", False),
+            "flipY": wc_cfg.get("flipY", False),
+            "rotate90": wc_cfg.get("rotate90", False)
+        }
+        self._send_sp("webcam", wc_data)
+
     def _push_initial_state(self):
         # TODO: This method is called after SP is connected
         # and ready to receive state.  We need a list of items
@@ -779,6 +801,7 @@ class SimplyPrint(Subscribable):
             self._send_sp("cpu_info", self.cache.cpu_info)
         self._send_sp("ambient", {"new": self.amb_detect.ambient})
         self.eventloop.create_task(self._send_machine_data())
+        self.eventloop.create_task(self._send_webcam_config())
 
     def _send_sp(self, evt_name: str, data: Any) -> asyncio.Future:
         if not self.connected or self.ws is None:
