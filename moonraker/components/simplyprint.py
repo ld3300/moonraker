@@ -10,6 +10,7 @@ import json
 import logging
 import time
 import pathlib
+import base64
 import tornado.websocket
 from websockets import Subscribable, WebRequest
 # XXX: The below imports are for inital dev and
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from components.job_state import JobState
     from components.machine import Machine
     from components.file_manager.file_manager import FileManager
+    from components.http_client import HttpClient
     from klippy_connection import KlippyConnection
 
 COMPONENT_VERSION = "0.0.1"
@@ -53,7 +55,6 @@ class SimplyPrint(Subscribable):
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.eventloop = self.server.get_event_loop()
-        self.webcam_name = config.get("webcam_name", "")
         self.job_state: JobState
         self.job_state = self.server.lookup_component("job_state")
         self.klippy_apis: KlippyAPI
@@ -71,6 +72,7 @@ class SimplyPrint(Subscribable):
             self.sp_info.get("ambient_temp", INITIAL_AMBIENT)
         )
         self.layer_detect = LayerDetect()
+        self.webcam_stream = WebcamStream(config, self._send_image)
         self.last_received_temps: Dict[str, float] = {}
         self.last_err_log_time: float = 0.
         self.last_cpu_update_time: float = 0.
@@ -314,6 +316,11 @@ class SimplyPrint(Subscribable):
                 script = "\n".join(script_list)
                 coro = self.klippy_apis.run_gcode(script, None)
                 self.eventloop.create_task(coro)
+        elif demand == "stream_on":
+            interval: float = args.get("interval", 1000) / 1000
+            self.webcam_stream.start(interval)
+        elif demand == "stream_off":
+            self.webcam_stream.stop()
         else:
             self._logger.info(f"Unknown demand: {demand}")
 
@@ -754,25 +761,16 @@ class SimplyPrint(Subscribable):
         self._send_sp("tool", {"new": tool})
 
     async def _send_webcam_config(self) -> None:
-        db: MoonrakerDatabase = self.server.lookup_component("database")
-        webcams: Dict[str, Dict[str, Any]]
-        webcams = await db.get_item("webcams", default={})
-        if not webcams:
-            return
-        wc_cfg: Dict[str, Any] = webcams[list(webcams.keys())[0]]
-        if not self.webcam_name:
-            wc_cfg = webcams[list(webcams.keys())[0]]
-        else:
-            for cfg in webcams.values():
-                if cfg.get("name", "") == self.webcam_name:
-                    wc_cfg = cfg
-                    break
+        wc_cfg = await self.webcam_stream.get_webcam_config()
         wc_data = {
             "flipH": wc_cfg.get("flipX", False),
             "flipY": wc_cfg.get("flipY", False),
             "rotate90": wc_cfg.get("rotate90", False)
         }
         self._send_sp("webcam", wc_data)
+
+    def _send_image(self, base_image: str) -> None:
+        self._send_sp("stream", {"base": base_image})
 
     def _push_initial_state(self):
         # TODO: This method is called after SP is connected
@@ -857,6 +855,7 @@ class SimplyPrint(Subscribable):
         return diff
 
     async def close(self):
+        self.webcam_stream.stop()
         await self._send_sp("shutdown", None)
         self.qlistner.stop()
         self.amb_detect.stop()
@@ -1022,6 +1021,80 @@ class LayerDetect:
         self._fl_height = 0.
         self._layer_count = 99999999999
         self._check_next = False
+
+
+# TODO: We need to get the URL/Port from settings in the future.
+# Ideally we will always fetch from the localhost rather than
+# go through the reverse proxy
+SNAPSHOT_URL = "http://127.0.0.1:8080/?action=snapshot"
+
+class WebcamStream:
+    def __init__(
+        self, config: ConfigHelper, image_callback: Callable[[str], None]
+    ) -> None:
+        self.server = config.get_server()
+        self.eventloop = self.server.get_event_loop()
+        self.webcam_name = config.get("webcam_name", "")
+        self.url = SNAPSHOT_URL
+        self.client: HttpClient = self.server.lookup_component("http_client")
+        self.running = False
+        self.interval: float = 1.
+        self.on_image_received = image_callback
+        self.stream_task: Optional[asyncio.Task] = None
+
+    async def get_webcam_config(self) -> Dict[str, Any]:
+        db: MoonrakerDatabase = self.server.lookup_component("database")
+        webcams: Dict[str, Dict[str, Any]]
+        webcams = await db.get_item("webcams", default={})
+        if not webcams:
+            return {}
+        wc_cfg: Dict[str, Any] = webcams[list(webcams.keys())[0]]
+        if not self.webcam_name:
+            wc_cfg = webcams[list(webcams.keys())[0]]
+        else:
+            for cfg in webcams.values():
+                if cfg.get("name", "") == self.webcam_name:
+                    wc_cfg = cfg
+                    break
+        return wc_cfg
+
+    async def extract_image(self) -> None:
+        headers = {"Accept": "image/jpeg"}
+        resp = await self.client.get(self.url, headers, enable_cache=False)
+        if resp.has_error():
+            # TODO: We should probably log an error and quite the
+            # stream here
+            return
+        encoded = await self.eventloop.run_in_thread(
+            self._encode_image, resp.content
+        )
+        self.on_image_received(encoded)
+
+    def _encode_image(self, image: bytes) -> str:
+        return base64.b64encode(image).decode()
+
+    async def _stream(self) -> None:
+        while self.running:
+            try:
+                await self.extract_image()
+                await asyncio.sleep(self.interval)
+            except asyncio.CancelledError:
+                break
+
+    def start(self, interval: float) -> None:
+        if self.running:
+            return
+        self.interval = interval
+        self.running = True
+        self.stream_task = self.eventloop.create_task(self._stream())
+
+    def stop(self) -> None:
+        if not self.running:
+            return
+        self.running = False
+        if self.stream_task is not None:
+            self.stream_task.cancel()
+            self.stream_task = None
 
 def load_component(config: ConfigHelper) -> SimplyPrint:
     return SimplyPrint(config)
