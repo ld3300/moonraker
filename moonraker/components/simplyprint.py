@@ -807,7 +807,10 @@ class SimplyPrint(Subscribable):
             fut.set_result(False)
             return fut
         packet = {"type": evt_name, "data": data}
-        self._logger.info(f"sent: {packet}")
+        if evt_name != "stream":
+            self._logger.info(f"sent: {packet}")
+        else:
+            self._logger.info("sent: webcam stream")
         self._reset_keepalive()
         return self.ws.write_message(json.dumps(packet))
 
