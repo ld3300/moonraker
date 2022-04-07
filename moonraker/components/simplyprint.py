@@ -54,6 +54,8 @@ CONNECTION_ERROR_LOG_TIME = 60.
 class SimplyPrint(Subscribable):
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
+        # XXX: The call below is for dev, remove before release
+        self._setup_simplyprint_logging()
         self.eventloop = self.server.get_event_loop()
         self.job_state: JobState
         self.job_state = self.server.lookup_component("job_state")
@@ -73,6 +75,7 @@ class SimplyPrint(Subscribable):
         )
         self.layer_detect = LayerDetect()
         self.webcam_stream = WebcamStream(config, self._send_image)
+        self.print_handler = PrintHandler(self)
         self.last_received_temps: Dict[str, float] = {}
         self.last_err_log_time: float = 0.
         self.last_cpu_update_time: float = 0.
@@ -91,6 +94,7 @@ class SimplyPrint(Subscribable):
         self.reconnect_token: Optional[str] = None
         self.printer_info_timer = self.eventloop.register_timer(
             self._handle_printer_info_update)
+        self._print_request_event: asyncio.Event = asyncio.Event()
         self.next_temp_update_time: float = 0.
         self._last_ping_received: float = 0.
         self.gcode_terminal_enabled: bool = False
@@ -150,9 +154,6 @@ class SimplyPrint(Subscribable):
         self.server.register_event_handler(
             "klippy_connection:gcode_received", self._on_gcode_received
         )
-
-        # XXX: The call below is for dev, remove before release
-        self._setup_simplyprint_logging()
 
         # TODO: We need the ability to show users the activation code.
         # Hook into announcements?  Create endpoint to get
@@ -271,7 +272,7 @@ class SimplyPrint(Subscribable):
                 self._logger.info(f"Invalid message, no data")
                 return
             printer_id = data.get("id")
-            if not isinstance(token, str):
+            if not isinstance(printer_id, str):
                 self._logger.info(f"Invalid printer id in message")
                 return
             logging.info(f"SimplyPrint Printer ID Received: {printer_id}")
@@ -303,14 +304,16 @@ class SimplyPrint(Subscribable):
     def _process_demand(self, demand: str, args: Dict[str, Any]) -> None:
         kconn: KlippyConnection
         kconn = self.server.lookup_component("klippy_connection")
-        if not kconn.is_connected():
-            return
         if demand in ["pause", "resume", "cancel"]:
+            if not kconn.is_connected():
+                return
             self.eventloop.create_task(self._request_print_action(demand))
         elif demand == "terminal":
             if "enabled" in args:
                 self.gcode_terminal_enabled = args["enabled"]
         elif demand == "gcode":
+            if not kconn.is_connected():
+                return
             script_list = args.get("list", [])
             if script_list:
                 script = "\n".join(script_list)
@@ -321,6 +324,21 @@ class SimplyPrint(Subscribable):
             self.webcam_stream.start(interval)
         elif demand == "stream_off":
             self.webcam_stream.stop()
+        elif demand == "file":
+            url: Optional[str] = args.get("url")
+            if not isinstance(url, str):
+                self._logger.info(f"Invalid url in message")
+                return
+            start = bool(args.get("auto_start", 0))
+            self.print_handler.download_file(url, start)
+        elif demand == "start_print":
+            if (
+                kconn.is_connected() and
+                self.cache.state == "operational"
+            ):
+                self.eventloop.create_task(self.print_handler.start_print())
+            else:
+                self._logger.info("Failed to start print")
         else:
             self._logger.info(f"Unknown demand: {demand}")
 
@@ -343,19 +361,28 @@ class SimplyPrint(Subscribable):
     async def _request_print_action(self, action: str) -> None:
         cur_state = self.cache.state
         ret: Optional[str] = ""
+        self._print_request_event.clear()
         if action == "pause":
             if cur_state == "printing":
+                self._update_state("pausing")
                 ret = await self.klippy_apis.pause_print(None)
         elif action == "resume":
             if cur_state == "paused":
+                self._print_request_fut = self.eventloop.create_future()
+                self._update_state("resuming")
                 ret = await self.klippy_apis.resume_print(None)
         elif action == "cancel":
             if cur_state in ["printing", "paused"]:
+                self._update_state("cancelling")
                 ret = await self.klippy_apis.cancel_print(None)
         if ret is None:
-            # Make sure the event fired so we can reset
-            await asyncio.sleep(.05)
-            self._update_state(cur_state)
+            # Wait for the "action" requested event to fire, then reset the
+            # state
+            try:
+                await asyncio.wait_for(self._print_request_event.wait(), 1.)
+            except Exception:
+                pass
+            self._update_state_from_klippy()
 
     async def _on_klippy_ready(self):
         last_stats: Dict[str, Any] = self.job_state.get_last_stats()
@@ -427,7 +454,7 @@ class SimplyPrint(Subscribable):
             }
             self.cache.firmware_info.update(ui_data)
             self.cache.current_wsid = ws.uid
-            self._send_sp("machine_data", ui_data)
+            self.send_sp("machine_data", ui_data)
 
     def _on_websocket_removed(self, ws: WebSocket) -> None:
         if self.cache.current_wsid is None or self.cache.current_wsid != ws.uid:
@@ -436,21 +463,22 @@ class SimplyPrint(Subscribable):
         diff = self._get_object_diff(ui_data, self.cache.firmware_info)
         if diff:
             self.cache.firmware_info.update(ui_data)
-            self._send_sp("machine_data", ui_data)
+            self.send_sp("machine_data", ui_data)
 
     def _on_klippy_startup(self, state: str) -> None:
         if state != "ready":
             self._update_state("error")
-            self._send_sp("printer_error", None)
-        self._send_sp("connection", {"new": "connected"})
+            self.send_sp("printer_error", None)
+        self.send_sp("connection", {"new": "connected"})
         self._send_firmware_data()
 
     def _on_klippy_shutdown(self) -> None:
-        self._send_sp("printer_error", None)
+        self._update_state("error")
+        self.send_sp("printer_error", None)
 
     def _on_klippy_disconnected(self) -> None:
         self._update_state("offline")
-        self._send_sp("connection", {"new": "disconnected"})
+        self.send_sp("connection", {"new": "disconnected"})
         self.amb_detect.stop()
         self.printer_info_timer.stop()
         self.cache.reset_print_state()
@@ -482,7 +510,7 @@ class SimplyPrint(Subscribable):
         self._send_job_event(job_info)
 
     def _on_print_paused(self, *args) -> None:
-        self._send_sp("job_info", {"paused": True})
+        self.send_sp("job_info", {"paused": True})
         self._update_state("paused")
         self.layer_detect.stop()
 
@@ -514,14 +542,17 @@ class SimplyPrint(Subscribable):
         self.layer_detect.stop()
 
     def _on_pause_requested(self) -> None:
+        self._print_request_event.set()
         if self.cache.state == "printing":
             self._update_state("pausing")
 
     def _on_resume_requested(self) -> None:
+        self._print_request_event.set()
         if self.cache.state == "paused":
             self._update_state("resuming")
 
     def _on_cancel_requested(self) -> None:
+        self._print_request_event.set()
         if self.cache.state in ["printing", "paused", "pausing"]:
             self._update_state("cancelling")
 
@@ -530,12 +561,12 @@ class SimplyPrint(Subscribable):
             resp = [
                 r.strip() for r in response.strip().split("\n") if r.strip()
             ]
-            self._send_sp("term_update", {"response": resp})
+            self.send_sp("term_update", {"response": resp})
 
     def _on_gcode_received(self, script: str):
         if self.gcode_terminal_enabled:
             cmds = [s.strip() for s in script.strip().split() if s.strip()]
-            self._send_sp("term_update", {"command": cmds})
+            self.send_sp("term_update", {"command": cmds})
 
     def _on_proc_update(self, proc_stats: Dict[str, Any]) -> None:
         cpu = proc_stats["system_cpu_usage"]
@@ -558,14 +589,14 @@ class SimplyPrint(Subscribable):
         diff = self._get_object_diff(cpu_data, self.cache.cpu_info)
         if diff:
             self.cache.cpu_info.update(cpu_data)
-            self._send_sp("cpu", diff)
+            self.send_sp("cpu", diff)
 
     def _on_cpu_throttled(self, throttled_state: Dict[str, Any]):
         self.cache.throttled_state = throttled_state
 
     def _on_ambient_changed(self, new_ambient: int) -> None:
         self._save_item("ambient_temp", new_ambient)
-        self._send_sp("ambient", {"new": new_ambient})
+        self.send_sp("ambient", {"new": new_ambient})
 
     def send_status(self, status: Dict[str, Any], eventtime: float) -> None:
         for printer_obj, vals in status.items():
@@ -608,7 +639,7 @@ class SimplyPrint(Subscribable):
             job_info["layer"] = layer
         if job_info:
             self.cache.job_info.update(job_info)
-            self._send_sp("job_info", job_info)
+            self.send_sp("job_info", job_info)
 
     def _update_temps(self, eventtime: float) -> None:
         if eventtime < self.next_temp_update_time:
@@ -653,7 +684,7 @@ class SimplyPrint(Subscribable):
         if not temp_data:
             return
         if self.is_set_up:
-            self._send_sp("temps", temp_data)
+            self.send_sp("temps", temp_data)
 
     def _update_state_from_klippy(self) -> None:
         kstate = self.server.get_klippy_state()
@@ -669,17 +700,19 @@ class SimplyPrint(Subscribable):
         if self.cache.state == new_state:
             return
         self.cache.state = new_state
-        self._send_sp("state_change", {"new": new_state})
+        self.send_sp("state_change", {"new": new_state})
+        if new_state == "operational":
+            self.print_handler.notify_ready()
 
     def _send_mesh_data(self) -> None:
         mesh = self.printer_status["bed_mesh"]
         # TODO: We are probably going to have to reformat the mesh
         self.cache.mesh = mesh
-        self._send_sp("mesh_data", mesh)
+        self.send_sp("mesh_data", mesh)
 
     def _send_job_event(self, job_info: Dict[str, Any]) -> None:
         if self.connected:
-            self._send_sp("job_info", job_info)
+            self.send_sp("job_info", job_info)
         else:
             job_info.update(self.cache.job_info)
             job_info["delay"] = self.eventloop.get_loop_time()
@@ -724,7 +757,7 @@ class SimplyPrint(Subscribable):
         diff = self._get_object_diff(data, self.cache.machine_info)
         if diff:
             self.cache.machine_info = data
-            self._send_sp("machine_data", diff)
+            self.send_sp("machine_data", diff)
 
     def _send_firmware_data(self):
         kinfo = self.server.get_klippy_info()
@@ -751,26 +784,26 @@ class SimplyPrint(Subscribable):
         diff = self._get_object_diff(fw_info, self.cache.firmware_info)
         if diff:
             self.cache.firmware_info = fw_info
-            self._send_sp("firmware", {"fw": diff, "raw": False})
+            self.send_sp("firmware", {"fw": diff, "raw": False})
 
     def _send_active_extruder(self, new_extruder: str):
         tool = "T0" if new_extruder == "extruder" else f"T{new_extruder[8:]}"
         if tool == self.cache.active_extruder:
             return
         self.cache.active_extruder = tool
-        self._send_sp("tool", {"new": tool})
+        self.send_sp("tool", {"new": tool})
 
     async def _send_webcam_config(self) -> None:
         wc_cfg = await self.webcam_stream.get_webcam_config()
         wc_data = {
             "flipH": wc_cfg.get("flipX", False),
-            "flipY": wc_cfg.get("flipY", False),
+            "flipV": wc_cfg.get("flipY", False),
             "rotate90": wc_cfg.get("rotate90", False)
         }
-        self._send_sp("webcam", wc_data)
+        self.send_sp("webcam", wc_data)
 
     def _send_image(self, base_image: str) -> None:
-        self._send_sp("stream", {"base": base_image})
+        self.send_sp("stream", {"base": base_image})
 
     def _push_initial_state(self):
         # TODO: This method is called after SP is connected
@@ -781,27 +814,27 @@ class SimplyPrint(Subscribable):
         # The firmware data and machine data is likely saved by
         # simplyprint.  It might be better for SP to request it
         # rather than for the client to send it on every connection.
-        self._send_sp("state_change", {"new": self.cache.state})
+        self.send_sp("state_change", {"new": self.cache.state})
         if self.cache.temps and self.is_set_up:
-            self._send_sp("temps", self.cache.temps)
+            self.send_sp("temps", self.cache.temps)
         if self.cache.firmware_info:
-            self._send_sp(
+            self.send_sp(
                 "firmware",
                 {"fw": self.cache.firmware_info, "raw": False})
         curtime = self.eventloop.get_loop_time()
         for evt in self.missed_job_events:
             evt["delay"] = int((curtime - evt["delay"]) + .5)
-            self._send_sp("job_info", evt)
-        if self.cache.active_extruder:
-            self._send_sp("tool", {"new": self.cache.active_extruder})
+            self.send_sp("job_info", evt)
         self.missed_job_events = []
+        if self.cache.active_extruder:
+            self.send_sp("tool", {"new": self.cache.active_extruder})
         if self.cache.cpu_info:
-            self._send_sp("cpu_info", self.cache.cpu_info)
-        self._send_sp("ambient", {"new": self.amb_detect.ambient})
+            self.send_sp("cpu_info", self.cache.cpu_info)
+        self.send_sp("ambient", {"new": self.amb_detect.ambient})
         self.eventloop.create_task(self._send_machine_data())
         self.eventloop.create_task(self._send_webcam_config())
 
-    def _send_sp(self, evt_name: str, data: Any) -> asyncio.Future:
+    def send_sp(self, evt_name: str, data: Any) -> asyncio.Future:
         if not self.connected or self.ws is None:
             fut = self.eventloop.create_future()
             fut.set_result(False)
@@ -822,7 +855,7 @@ class SimplyPrint(Subscribable):
 
     def _do_keepalive(self):
         self.keepalive_hdl = None
-        self._send_sp("keepalive", None)
+        self.send_sp("keepalive", None)
 
     def _setup_simplyprint_logging(self):
         fm: FileManager = self.server.lookup_component("file_manager")
@@ -858,8 +891,9 @@ class SimplyPrint(Subscribable):
         return diff
 
     async def close(self):
+        self.print_handler.cancel()
         self.webcam_stream.stop()
-        await self._send_sp("shutdown", None)
+        await self.send_sp("shutdown", None)
         self.qlistner.stop()
         self.amb_detect.stop()
         self.printer_info_timer.stop()
@@ -1098,6 +1132,135 @@ class WebcamStream:
         if self.stream_task is not None:
             self.stream_task.cancel()
             self.stream_task = None
+
+class PrintHandler:
+    def __init__(self, simplyprint: SimplyPrint) -> None:
+        self.simplyprint = simplyprint
+        self._logger = simplyprint._logger
+        self.server = simplyprint.server
+        self.eventloop = self.server.get_event_loop()
+        self.cache = simplyprint.cache
+        self.download_task: Optional[asyncio.Task] = None
+        self.print_ready_event: asyncio.Event = asyncio.Event()
+        self.download_progress: int = -1
+        self.pending_file: str = ""
+
+    def download_file(self, url: str, start: bool):
+        coro = self._download_sp_file(url, start)
+        self.download_task = self.eventloop.create_task(coro)
+
+    def cancel(self):
+        if (
+            self.download_task is not None and
+            not self.download_task.done()
+        ):
+            self.download_task.cancel()
+            self.download_task = None
+
+    def notify_ready(self):
+        self.print_ready_event.set()
+
+    async def _download_sp_file(self, url: str, start: bool):
+        client: HttpClient = self.server.lookup_component("http_client")
+        fm: FileManager = self.server.lookup_component("file_manager")
+        gc_path = pathlib.Path(fm.get_directory())
+        if not gc_path.is_dir():
+            self._logger.info(f"GCode Path Not Registered: {gc_path}")
+            self.simplyprint.send_sp(
+                "file_progress",
+                {"state": "error", "message": "GCode Path not Registered"}
+            )
+            return
+        url = client.escape_url(url)
+        accept = "text/plain,applicaton/octet-stream"
+        self._on_download_progress(0, 0, 0)
+        try:
+            self._logger.info(f"Downloading URL: {url}")
+            tmp_path = await client.download_file(
+                url, accept, progress_callback=self._on_download_progress,
+                request_timeout=3600.
+            )
+        except asyncio.TimeoutError:
+            raise
+        except Exception:
+            self._logger.exception(f"Failed to download file: {url}")
+            self.simplyprint.send_sp(
+                "file_progress",
+                {"state": "error", "message": "Network Error"}
+            )
+            return
+        finally:
+            self.download_progress = -1
+        self._logger.info("Download Complete")
+        filename = pathlib.PurePath(tmp_path.name)
+        fpath = gc_path.joinpath(filename.name)
+        if self.cache.job_info.get("filename", "") == str(fpath):
+            # This is an attempt to overwite a print in progress, make a copy
+            count = 0
+            while fpath.exists():
+                name = f"{filename.stem}_copy_{count}.{filename.suffix}"
+                fpath = gc_path.joinpath(name)
+                count += 1
+        args: Dict[str, Any] = {
+            "filename": fpath.name,
+            "tmp_file_path": str(tmp_path),
+        }
+        state = "pending"
+        if self.cache.state == "operational":
+            state = "ready"
+            args["print"] = "true" if start else "false"
+        try:
+            ret = await fm.finalize_upload(args)
+        except self.server.error as e:
+            self._logger.exception("GCode Finalization Failed")
+            self.simplyprint.send_sp(
+                "file_progress",
+                {"state": "error", "message": f"GCode Finalization Failed: {e}"}
+            )
+            return
+        if ret.get("print_started", False):
+            state = "started"
+        else:
+            self.pending_file = fpath.name
+        if state == "pending":
+            self.print_ready_event.clear()
+            try:
+                await asyncio.wait_for(self.print_ready_event.wait(), 10.)
+            except asyncio.TimeoutError:
+                self.pending_file = ""
+                self.simplyprint.send_sp(
+                    "file_progress",
+                    {"state": "error", "message": "Pending print timed out"}
+                )
+                return
+            else:
+                if start:
+                    await self.start_print()
+                    return
+                state = "ready"
+        self.simplyprint.send_sp("file_progress", {"state": state})
+
+    async def start_print(self):
+        if not self.pending_file:
+            return
+        pending = self.pending_file
+        self.pending_file = ""
+        kapi: KlippyAPI = self.server.lookup_component("klippy_apis")
+        data = {"state": "started"}
+        try:
+            await kapi.start_print(pending["filename"])
+        except Exception:
+            data["state"] = "error"
+            data["message"] = "Failed to start print"
+        self.simplyprint.send_sp("file_progress", data)
+
+    def _on_download_progress(self, percent: int, size: int, recd: int) -> None:
+        if percent == self.download_progress:
+            return
+        self.download_progress = percent
+        self.simplyprint.send_sp(
+            "file_progress", {"state": "downloading", "percent": percent}
+        )
 
 def load_component(config: ConfigHelper) -> SimplyPrint:
     return SimplyPrint(config)
