@@ -69,10 +69,8 @@ class SimplyPrint(Subscribable):
         self.test = config.get("sp_test", True)
         self.ws: Optional[WebSocketClientConnection] = None
         self.cache = ReportCache()
-        self.amb_detect = AmbientDetect(
-            config, self.cache, self._on_ambient_changed,
-            self.sp_info.get("ambient_temp", INITIAL_AMBIENT)
-        )
+        ambient = self.sp_info.get("ambient_temp", INITIAL_AMBIENT)
+        self.amb_detect = AmbientDetect(config, self, ambient)
         self.layer_detect = LayerDetect()
         self.webcam_stream = WebcamStream(config, self)
         self.print_handler = PrintHandler(self)
@@ -247,7 +245,7 @@ class SimplyPrint(Subscribable):
                 self.reconnect_token = data.get("reconnect_token")
                 name = data.get("name")
                 if name is not None:
-                    self._save_item("printer_name", name)
+                    self.save_item("printer_name", name)
             self.reconnect_delay = 1.
             self._push_initial_state()
         elif event == "error":
@@ -263,7 +261,7 @@ class SimplyPrint(Subscribable):
                 self._logger.info(f"Invalid token in message")
                 return
             logging.info(f"SimplyPrint Token Received")
-            self._save_item("printer_token", token)
+            self.save_item("printer_token", token)
             self._set_ws_url()
         elif event == "set_up":
             # TODO: This is a stubbed event to receive the printer ID,
@@ -276,14 +274,14 @@ class SimplyPrint(Subscribable):
                 self._logger.info(f"Invalid printer id in message")
                 return
             logging.info(f"SimplyPrint Printer ID Received: {printer_id}")
-            self._save_item("printer_id", printer_id)
+            self.save_item("printer_id", printer_id)
             self._set_ws_url()
             name = data.get("name")
             if not isinstance(name, str):
                 self._logger.info(f"Invalid name in message: {msg}")
                 return
             logging.info(f"SimplyPrint Printer ID Received: {name}")
-            self._save_item("printer_name", name)
+            self.save_item("printer_name", name)
         elif event == "demand":
             if data is None:
                 self._logger.info(f"Invalid message, no data")
@@ -342,7 +340,7 @@ class SimplyPrint(Subscribable):
         else:
             self._logger.info(f"Unknown demand: {demand}")
 
-    def _save_item(self, name: str, data: Any):
+    def save_item(self, name: str, data: Any):
         self.sp_info[name] = data
         self.spdb[name] = data
 
@@ -593,10 +591,6 @@ class SimplyPrint(Subscribable):
 
     def _on_cpu_throttled(self, throttled_state: Dict[str, Any]):
         self.cache.throttled_state = throttled_state
-
-    def _on_ambient_changed(self, new_ambient: int) -> None:
-        self._save_item("ambient_temp", new_ambient)
-        self.send_sp("ambient", {"new": new_ambient})
 
     def send_status(self, status: Dict[str, Any], eventtime: float) -> None:
         for printer_obj, vals in status.items():
@@ -935,15 +929,14 @@ class AmbientDetect:
     def __init__(
         self,
         config: ConfigHelper,
-        cache: ReportCache,
-        changed_cb: Callable[[int], None],
+        simplyprint: SimplyPrint,
         initial_ambient: int
     ) -> None:
         self.server = config.get_server()
-        self.cache = cache
+        self.simplyprint = simplyprint
+        self.cache = simplyprint.cache
         self._initial_sample: int = -1000
         self._ambient = initial_ambient
-        self._on_ambient_changed = changed_cb
         self._last_sample_time: float = 0.
         self._update_interval = AMBIENT_CHECK_TIME
         eventloop = self.server.get_event_loop()
@@ -983,6 +976,10 @@ class AmbientDetect:
                 self._initial_sample = temp
                 self._update_interval = SAMPLE_CHECK_TIME
         return eventtime + self.CHECK_INTERVAL
+
+    def _on_ambient_changed(self, new_ambient: int) -> None:
+        self.simplyprint.save_item("ambient_temp", new_ambient)
+        self.simplyprint.send_sp("ambient", {"new": new_ambient})
 
     def start(self) -> None:
         if self._detect_timer.is_running():
