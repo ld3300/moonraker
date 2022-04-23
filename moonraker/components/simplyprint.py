@@ -74,7 +74,7 @@ class SimplyPrint(Subscribable):
             self.sp_info.get("ambient_temp", INITIAL_AMBIENT)
         )
         self.layer_detect = LayerDetect()
-        self.webcam_stream = WebcamStream(config, self._send_image)
+        self.webcam_stream = WebcamStream(config, self)
         self.print_handler = PrintHandler(self)
         self.last_received_temps: Dict[str, float] = {}
         self.last_err_log_time: float = 0.
@@ -802,9 +802,6 @@ class SimplyPrint(Subscribable):
         }
         self.send_sp("webcam", wc_data)
 
-    def _send_image(self, base_image: str) -> None:
-        self.send_sp("stream", {"base": base_image})
-
     def _push_initial_state(self):
         # TODO: This method is called after SP is connected
         # and ready to receive state.  We need a list of items
@@ -1067,16 +1064,16 @@ SNAPSHOT_URL = "http://127.0.0.1:8080/?action=snapshot"
 
 class WebcamStream:
     def __init__(
-        self, config: ConfigHelper, image_callback: Callable[[str], None]
+        self, config: ConfigHelper, simplyprint: SimplyPrint
     ) -> None:
         self.server = config.get_server()
         self.eventloop = self.server.get_event_loop()
+        self.simplyprint = simplyprint
         self.webcam_name = config.get("webcam_name", "")
         self.url = SNAPSHOT_URL
         self.client: HttpClient = self.server.lookup_component("http_client")
         self.running = False
         self.interval: float = 1.
-        self.on_image_received = image_callback
         self.stream_task: Optional[asyncio.Task] = None
 
     async def get_webcam_config(self) -> Dict[str, Any]:
@@ -1105,10 +1102,13 @@ class WebcamStream:
         encoded = await self.eventloop.run_in_thread(
             self._encode_image, resp.content
         )
-        self.on_image_received(encoded)
+        self._send_image(encoded)
 
     def _encode_image(self, image: bytes) -> str:
         return base64.b64encode(image).decode()
+
+    def _send_image(self, base_image: str) -> None:
+        self.simplyprint.send_sp("stream", {"base": base_image})
 
     async def _stream(self) -> None:
         while self.running:
