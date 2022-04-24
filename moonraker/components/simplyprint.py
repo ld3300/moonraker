@@ -1214,12 +1214,12 @@ class PrintHandler:
                 {"state": "error", "message": f"GCode Finalization Failed: {e}"}
             )
             return
+        self.pending_file = fpath.name
         if ret.get("print_started", False):
             state = "started"
+            self.pending_file = ""
         elif not start and await self._check_can_print():
             state = "ready"
-        else:
-            self.pending_file = fpath.name
         if state == "pending":
             self.print_ready_event.clear()
             try:
