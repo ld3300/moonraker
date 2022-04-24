@@ -1204,7 +1204,6 @@ class PrintHandler:
         }
         state = "pending"
         if self.cache.state == "operational":
-            state = "ready"
             args["print"] = "true" if start else "false"
         try:
             ret = await fm.finalize_upload(args)
@@ -1217,6 +1216,8 @@ class PrintHandler:
             return
         if ret.get("print_started", False):
             state = "started"
+        elif not start and await self._check_can_print():
+            state = "ready"
         else:
             self.pending_file = fpath.name
         if state == "pending":
@@ -1247,9 +1248,26 @@ class PrintHandler:
         try:
             await kapi.start_print(pending["filename"])
         except Exception:
+            logging.exception("Print Failed to start")
             data["state"] = "error"
             data["message"] = "Failed to start print"
         self.simplyprint.send_sp("file_progress", data)
+
+    async def _check_can_print(self) -> bool:
+        if self.server.get_klippy_state() != "ready":
+            return False
+        kapi: KlippyAPI = self.server.lookup_component("klippy_apis")
+        try:
+            result = await kapi.query_objects({"print_stats": None})
+        except Exception:
+            # Klippy not connected
+            return False
+        if 'print_stats' not in result:
+            return False
+        state: str = result['print_stats']['state']
+        if state in ["printing", "paused"]:
+            return False
+        return True
 
     def _on_download_progress(self, percent: int, size: int, recd: int) -> None:
         if percent == self.download_progress:
