@@ -507,6 +507,18 @@ class SimplyPrint(Subscribable):
         self.layer_detect.start(metadata)
         self._send_job_event(job_info)
 
+    def _check_job_started(
+        self,
+        prev_stats: Dict[str, Any],
+        new_stats: Dict[str, Any]
+    ) -> None:
+        if not self.cache.job_info:
+            job_info: Dict[str, Any] = {
+                "filename": new_stats.get("filename", ""),
+                "started": True
+            }
+            self._send_job_event(job_info)
+
     def _on_print_paused(self, *args) -> None:
         self.send_sp("job_info", {"paused": True})
         self._update_state("paused")
@@ -517,18 +529,21 @@ class SimplyPrint(Subscribable):
         self.layer_detect.resume()
 
     def _on_print_cancelled(self, *args) -> None:
+        self._check_job_started(*args)
         self._send_job_event({"cancelled": True})
         self._update_state_from_klippy()
         self.cache.job_info = {}
         self.layer_detect.stop()
 
     def _on_print_error(self, *args) -> None:
+        self._check_job_started(*args)
         self._send_job_event({"failed": True})
         self._update_state_from_klippy()
         self.cache.job_info = {}
         self.layer_detect.stop()
 
     def _on_print_complete(self, *args) -> None:
+        self._check_job_started(*args)
         self._send_job_event({"finished": True})
         self._update_state_from_klippy()
         self.cache.job_info = {}
