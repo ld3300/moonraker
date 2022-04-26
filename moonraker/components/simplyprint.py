@@ -763,10 +763,8 @@ class SimplyPrint(Subscribable):
         data["local_ip"] = pub_intf.get("address", "Unknown")
         data["hostname"] = pub_intf["hostname"]
         self._logger.info(f"calculated machine data: {data}")
-        diff = self._get_object_diff(data, self.cache.machine_info)
-        if diff:
-            self.cache.machine_info = data
-            self.send_sp("machine_data", diff)
+        self.cache.machine_info = data
+        self.send_sp("machine_data", data)
 
     def _send_firmware_data(self):
         kinfo = self.server.get_klippy_info()
