@@ -786,12 +786,13 @@ class SimplyPrint(Subscribable):
             "firmware_version": version,
             "firmware_date": firmware_date,
             "firmware_link": "https://github.com/Klipper3d/klipper",
-            "firmware_unsafe": unsafe
         }
         diff = self._get_object_diff(fw_info, self.cache.firmware_info)
         if diff:
             self.cache.firmware_info = fw_info
-            self.send_sp("firmware", {"fw": diff, "raw": False})
+            self.send_sp(
+                "firmware", {"fw": diff, "raw": False, "unsafe": unsafe}
+            )
 
     def _send_active_extruder(self, new_extruder: str):
         tool = "T0" if new_extruder == "extruder" else f"T{new_extruder[8:]}"
