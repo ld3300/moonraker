@@ -87,7 +87,7 @@ class SimplyPrint(Subscribable):
         self.heaters: Dict[str, str] = {}
         self.missed_job_events: List[Dict[str, Any]] = []
         self.keepalive_hdl: Optional[asyncio.TimerHandle] = None
-        self.reconnect_hdl: Optional[asyncio.TimerHandle] = None
+        self.connection_task: Optional[asyncio.Task] = None
         self.reconnect_delay: float = 1.
         self.reconnect_token: Optional[str] = None
         self.printer_info_timer = self.eventloop.register_timer(
@@ -159,24 +159,26 @@ class SimplyPrint(Subscribable):
         # and present it at http://hostname/server/simplyprint
 
     async def component_init(self) -> None:
-        connected = await self._do_connect(try_once=True)
-        if not connected:
-            self.reconnect_hdl = self.eventloop.delay_callback(
-                5., self._do_connect)
+        self.connection_task = self.eventloop.create_task(self._connect())
 
-    async def _do_connect(self, try_once=False) -> bool:
-        url = self.connect_url
-        if self.reconnect_token is not None:
-            url = f"{self.connect_url}/{self.reconnect_token}"
-        self._logger.info(f"Connecting To SimplyPrint: {url}")
+    async def _connect(self) -> None:
+        log_connect = True
         while not self.is_closing:
+            url = self.connect_url
+            if self.reconnect_token is not None:
+                url = f"{self.connect_url}/{self.reconnect_token}"
+            if log_connect:
+                self._logger.info(f"Connecting To SimplyPrint: {url}")
+                log_connect = False
             try:
                 self.ws = await tornado.websocket.websocket_connect(
                     url, connect_timeout=5.,
-                    on_message_callback=self._on_ws_message)
+                )
                 setattr(self.ws, "on_ping", self._on_ws_ping)
                 cur_time = self.eventloop.get_loop_time()
                 self._last_ping_received = cur_time
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 curtime = self.eventloop.get_loop_time()
                 timediff = curtime - self.last_err_log_time
@@ -184,40 +186,39 @@ class SimplyPrint(Subscribable):
                     self.last_err_log_time = curtime
                     logging.exception(
                         f"Failed to connect to SimplyPrint")
-                if try_once:
-                    self.reconnect_hdl = None
-                    return False
-                await asyncio.sleep(self.reconnect_delay)
             else:
-                break
-        logging.info("Connected to SimplyPrint Cloud")
-        self.reconnect_hdl = None
-        return True
+                logging.info("Connected to SimplyPrint Cloud")
+                await self._read_messages()
+                log_connect = True
+            if not self.is_closing:
+                await asyncio.sleep(self.reconnect_delay)
 
-    def _on_ws_message(self, message: Union[str, bytes, None]) -> None:
-        if isinstance(message, str):
-            self._process_message(message)
-        elif message is None and not self.is_closing:
-            cur_time = self.eventloop.get_loop_time()
-            ping_time: float = cur_time - self._last_ping_received
-            reason = code = None
-            if self.ws is not None:
-                reason = self.ws.close_reason
-                code = self.ws.close_code
-            msg = (
-                f"SimplyPrint Disconnected - Code: {code}, Reason: {reason}, "
-                f"Server Ping Time Elapsed: {ping_time}"
-            )
-            logging.info(msg)
-            self._logger.info(msg)
-            self.connected = False
-            self.ws = None
-            if self.reconnect_hdl is None:
-                self.reconnect_hdl = self.eventloop.delay_callback(
-                    self.reconnect_delay, self._do_connect)
-            if self.keepalive_hdl is not None:
-                self.keepalive_hdl.cancel()
-                self.keepalive_hdl = None
+    async def _read_messages(self) -> None:
+        message: Union[str, bytes, None]
+        while self.ws is not None:
+            message = await self.ws.read_message()
+            if isinstance(message, str):
+                self._process_message(message)
+            elif message is None:
+                cur_time = self.eventloop.get_loop_time()
+                ping_time: float = cur_time - self._last_ping_received
+                reason = code = None
+                if self.ws is not None:
+                    reason = self.ws.close_reason
+                    code = self.ws.close_code
+                msg = (
+                    f"SimplyPrint Disconnected - Code: {code}, "
+                    f"Reason: {reason}, "
+                    f"Server Ping Time Elapsed: {ping_time}"
+                )
+                logging.info(msg)
+                self._logger.info(msg)
+                self.connected = False
+                self.ws = None
+                if self.keepalive_hdl is not None:
+                    self.keepalive_hdl.cancel()
+                    self.keepalive_hdl = None
+                break
 
     def _on_ws_ping(self, data: bytes = b"") -> None:
         self._last_ping_received = self.eventloop.get_loop_time()
@@ -903,14 +904,19 @@ class SimplyPrint(Subscribable):
         self.amb_detect.stop()
         self.printer_info_timer.stop()
         self.is_closing = True
-        if self.reconnect_hdl is not None:
-            # TODO, would be good to cancel the reconnect task as well
-            self.reconnect_hdl.cancel()
+        if self.ws is not None:
+            self.ws.close(1001, "Client Shutdown")
         if self.keepalive_hdl is not None:
             self.keepalive_hdl.cancel()
             self.keepalive_hdl = None
-        if self.ws is not None:
-            self.ws.close(1001, "Client Shutdown")
+        if (
+            self.connection_task is not None and
+            not self.connection_task.done()
+        ):
+            try:
+                await asyncio.wait_for(self.connection_task, 2.)
+            except asyncio.TimeoutError:
+                pass
 
 class ReportCache:
     def __init__(self) -> None:
